@@ -1,0 +1,531 @@
+"""
+Screen-rectangle calibration for the dual-camera pen tracker.
+
+Replaces the plane-mm homography (used by calibrate.py) with a per-camera
+homography that maps camera-pixel coordinates directly to screen-pixel
+coordinates inside one of two on-screen rectangles:
+
+    LEFT  rectangle  <- camera 2
+    RIGHT rectangle  <- camera 1
+
+Workflow (4 phases, run by this script in order):
+
+    1. Cursor phase L  - the OS cursor is confined to the LEFT rect; click
+                         4 arbitrary points inside it. Their screen pixel
+                         positions are recorded as the LEFT destination set.
+    2. Cursor phase R  - same for the RIGHT rect / cam1 destination set.
+    3. Pen phase L     - for each of the 4 LEFT screen points (highlighted
+                         in turn as a red target), place the orange pen on
+                         that physical spot so cam2 detects the tip there.
+                         Press ENTER to register the cam2 pixel.
+    4. Pen phase R     - same for cam1 / RIGHT rect.
+
+    H_cam1 maps cam1 pixels -> screen pixels inside the RIGHT rect.
+    H_cam2 maps cam2 pixels -> screen pixels inside the LEFT  rect.
+
+Outputs (same shape as the plane-mm .npz so tracker.py can swap them in):
+    calibration/cam1_screen_calibration.npz
+    calibration/cam2_screen_calibration.npz
+
+Each file contains: mtx, dist, H, rect ([x0,y0,x1,y1]), rms.
+
+Cursor confinement uses Win32 ClipCursor and is released the moment a
+phase ends - it never persists beyond this script.
+"""
+
+import os
+import re
+import sys
+import cv2
+import numpy as np
+import argparse
+import yaml
+import ctypes
+
+# Allow `from src.detect import ...` when run from the project root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.detect import OrangeTipDetector
+
+
+WINDOW      = "Screen Calibration"
+LEFT_COLOR  = (255, 200,  60)   # left rect / cam2
+RIGHT_COLOR = ( 60, 220, 255)   # right rect / cam1
+
+
+# ── Win32 helpers ─────────────────────────────────────────────────────────────
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left",   ctypes.c_long),
+                ("top",    ctypes.c_long),
+                ("right",  ctypes.c_long),
+                ("bottom", ctypes.c_long)]
+
+
+def _user32():
+    return ctypes.windll.user32
+
+
+def _clip_cursor(rect):
+    x0, y0, x1, y1 = rect
+    r = _RECT(int(x0), int(y0), int(x1), int(y1))
+    _user32().ClipCursor(ctypes.byref(r))
+
+
+def _unclip_cursor():
+    _user32().ClipCursor(None)
+
+
+def _set_cursor_pos(x, y):
+    _user32().SetCursorPos(int(x), int(y))
+
+
+def _get_screen_size():
+    u = _user32()
+    try:
+        u.SetProcessDPIAware()
+    except Exception:
+        pass
+    return u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize",    ctypes.c_ulong),
+                ("rcMonitor", _RECT),
+                ("rcWork",    _RECT),
+                ("dwFlags",   ctypes.c_ulong)]
+
+
+def _enum_monitors():
+    """Return [(x, y, w, h, is_primary), ...] for every connected display,
+    sorted with the primary first and then by x-origin. Coordinates are in
+    Win32 virtual-screen space (the primary monitor's top-left is (0,0);
+    secondary monitors are at positive or negative offsets)."""
+    _user32().SetProcessDPIAware()
+    monitors = []
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_int,
+        ctypes.c_void_p,            # HMONITOR
+        ctypes.c_void_p,            # HDC
+        ctypes.POINTER(_RECT),      # LPRECT
+        ctypes.c_void_p,            # LPARAM
+    )
+
+    def callback(hmon, hdc, lprect, data):
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        _user32().GetMonitorInfoW(hmon, ctypes.byref(info))
+        r = info.rcMonitor
+        monitors.append((int(r.left), int(r.top),
+                         int(r.right - r.left), int(r.bottom - r.top),
+                         bool(info.dwFlags & 1)))
+        return 1
+
+    _user32().EnumDisplayMonitors(0, 0, MONITORENUMPROC(callback), 0)
+    # Primary first, then left-to-right by origin.
+    monitors.sort(key=lambda m: (0 if m[4] else 1, m[0]))
+    return monitors
+
+
+def _resolve_monitor(monitor_index):
+    """Return (x, y, w, h) for the requested monitor, falling back to the
+    primary if the index is out of range."""
+    mons = _enum_monitors()
+    if not mons:
+        w, h = _get_screen_size()
+        return (0, 0, w, h)
+    idx = max(0, min(len(mons) - 1, int(monitor_index)))
+    if idx != int(monitor_index):
+        print(f"WARNING: monitor_index={monitor_index} out of range; "
+              f"using monitor {idx} of {len(mons)}.")
+    x, y, w, h, _ = mons[idx]
+    return (x, y, w, h)
+
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+
+def _default_rects(origin_x, origin_y, w, h, pad=40, gap=20):
+    """Side-by-side rectangles inside a monitor whose top-left is at
+    (origin_x, origin_y). All returned coords are in GLOBAL virtual-screen
+    space so they can be used directly with ClipCursor and SetCursorPos."""
+    half = (w - 2 * pad - gap) // 2
+    left  = (origin_x + pad,
+             origin_y + pad,
+             origin_x + pad + half,
+             origin_y + h - pad)
+    right = (origin_x + pad + half + gap,
+             origin_y + pad,
+             origin_x + pad + half + gap + half,
+             origin_y + h - pad)
+    return left, right
+
+
+def _rect_from_cfg(rect_cfg, default):
+    if rect_cfg is None:
+        return default
+    return tuple(int(v) for v in rect_cfg)
+
+
+def _to_local_rect(rect, ox, oy):
+    """Translate a GLOBAL rect into window-local coords for drawing."""
+    return (rect[0] - ox, rect[1] - oy, rect[2] - ox, rect[3] - oy)
+
+
+def _to_local_pt(pt, ox, oy):
+    return (pt[0] - ox, pt[1] - oy)
+
+
+def _persist_rects_to_config(config_path, rect_left, rect_right):
+    """In-place rewrite of `rect_left:` / `rect_right:` lines under `screen:`
+    so the resolved rectangles survive across runs. Uses line-targeted regex
+    so YAML comments and unrelated keys are preserved (unlike yaml.dump)."""
+    def fmt(r):
+        return f"[{int(r[0])}, {int(r[1])}, {int(r[2])}, {int(r[3])}]"
+    with open(config_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    text = re.sub(r'(?m)^(\s*rect_left:\s*).*$',
+                  lambda m: m.group(1) + fmt(rect_left),  text)
+    text = re.sub(r'(?m)^(\s*rect_right:\s*).*$',
+                  lambda m: m.group(1) + fmt(rect_right), text)
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+# ── Drawing primitives ───────────────────────────────────────────────────────
+
+def _blank(w, h):
+    # White background - the physical drawing surface is matte white, so
+    # matching the screen avoids reflections through the camera that a
+    # black background would amplify.
+    return np.full((h, w, 3), 255, dtype=np.uint8)
+
+
+def _draw_rect(img, rect, color, thickness=2):
+    cv2.rectangle(img, (rect[0], rect[1]), (rect[2], rect[3]), color, thickness)
+
+
+def _draw_point(img, pt, idx, color):
+    cv2.circle(img, (int(pt[0]), int(pt[1])),  8, color, -1)
+    cv2.circle(img, (int(pt[0]), int(pt[1])), 14, color,  1)
+    cv2.putText(img, str(idx + 1),
+                (int(pt[0]) + 14, int(pt[1]) - 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+
+def _draw_target(img, pt, idx):
+    cv2.circle(img, pt, 26, (0,   0, 255), 2)
+    cv2.circle(img, pt,  6, (0,   0, 255), -1)
+    cv2.line(img, (pt[0] - 36, pt[1]), (pt[0] + 36, pt[1]), (0, 0, 255), 1)
+    cv2.line(img, (pt[0], pt[1] - 36), (pt[0], pt[1] + 36), (0, 0, 255), 1)
+    cv2.putText(img, f"#{idx + 1}", (pt[0] + 28, pt[1] - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+
+def _draw_prompt(img, lines, color=(0, 0, 0)):
+    y = 36
+    for line in lines:
+        cv2.putText(img, line, (40, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        y += 32
+
+
+def _composite_camera_inset(img, frame, det, inset_w=320, pad=24):
+    """Paint a camera preview with detection overlay into the bottom-right."""
+    if frame is None:
+        return
+    H, W = img.shape[:2]
+    inset_h = int(frame.shape[0] * (inset_w / frame.shape[1]))
+    preview = cv2.resize(frame, (inset_w, inset_h))
+    if det.pixel_point is not None:
+        sx = inset_w / frame.shape[1]
+        sy = inset_h / frame.shape[0]
+        px = int(det.pixel_point[0] * sx)
+        py = int(det.pixel_point[1] * sy)
+        cv2.circle(preview, (px, py), 8, (0, 255, 0), 2)
+        cv2.line(preview, (px - 14, py), (px + 14, py), (0, 255, 0), 1)
+        cv2.line(preview, (px, py - 14), (px, py + 14), (0, 255, 0), 1)
+    else:
+        cv2.putText(preview, "NO PEN DETECTED", (6, inset_h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    x0 = W - inset_w - pad
+    y0 = H - inset_h - pad
+    img[y0:y0 + inset_h, x0:x0 + inset_w] = preview
+    cv2.rectangle(img, (x0 - 2, y0 - 2),
+                  (x0 + inset_w + 2, y0 + inset_h + 2),
+                  (160, 160, 160), 1)
+
+
+# ── Phase 1+2: cursor-click capture, confined to one rect ─────────────────────
+
+def collect_cursor_points(monitor, rect, other_rect, label, color):
+    """Capture 4 mouse clicks inside `rect`. Cursor is clipped to `rect`
+    for the duration. `rect` / `other_rect` and the returned points are all
+    in GLOBAL virtual-screen coordinates; drawing happens in window-local
+    coords (= global minus the monitor's origin)."""
+    ox, oy, mw, mh = monitor
+    points = []  # GLOBAL coords
+
+    def on_mouse(event, x, y, flags, param):
+        # OpenCV mouse callback gives window-local pixels; the window is
+        # placed at (ox, oy), so add that offset to recover global coords.
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+            points.append((x + ox, y + oy))
+
+    cv2.setMouseCallback(WINDOW, on_mouse)
+    _set_cursor_pos((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+    _clip_cursor(rect)
+
+    try:
+        while True:
+            canvas  = _blank(mw, mh)
+            l_other = _to_local_rect(other_rect, ox, oy)
+            l_rect  = _to_local_rect(rect,       ox, oy)
+            _draw_rect(canvas, l_other, (0, 0, 0), 1)
+            _draw_rect(canvas, l_rect,  (0, 0, 0), 2)
+            for i, pt in enumerate(points):
+                _draw_point(canvas, _to_local_pt(pt, ox, oy), i, color)
+            done = (len(points) >= 4)
+            prompt = [
+                f"CURSOR phase: {label}",
+                "Click 4 points anywhere inside the highlighted rectangle.",
+                f"Points: {len(points)}/4   (U = undo,  Q = abort"
+                + (",  SPACE = next phase" if done else "") + ")",
+            ]
+            _draw_prompt(canvas, prompt)
+            cv2.imshow(WINDOW, canvas)
+
+            key = cv2.waitKey(15) & 0xFF
+            if key == ord('q'):
+                raise RuntimeError(f"Aborted in cursor phase ({label}).")
+            if key == ord('u') and points:
+                points.pop()
+            if key == ord(' ') and done:
+                break
+    finally:
+        _unclip_cursor()
+        # Remove the mouse callback so it cannot fire during later phases.
+        cv2.setMouseCallback(WINDOW, lambda *a, **k: None)
+
+    return points
+
+
+# ── Phase 3+4: pen-detection capture for each previously-clicked screen point.
+
+def collect_pen_points(cap, detector, mtx, dist,
+                       monitor, rect, other_rect,
+                       screen_points, label, color):
+    """For each screen_point, wait for the user to put the pen on it (camera
+    detection visible in the inset) and press ENTER to register the camera-
+    pixel position. Returns [(u, v), ...] in cam-pixel coords. `rect`,
+    `other_rect`, and `screen_points` are all in GLOBAL coords."""
+    ox, oy, mw, mh = monitor
+    pixel_points = []
+    idx = 0
+
+    while idx < len(screen_points):
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            continue
+        undistorted = cv2.undistort(frame, mtx, dist)
+        det = detector.detect(undistorted)
+
+        canvas  = _blank(mw, mh)
+        l_other = _to_local_rect(other_rect, ox, oy)
+        l_rect  = _to_local_rect(rect,       ox, oy)
+        _draw_rect(canvas, l_other, (0, 0, 0), 1)
+        _draw_rect(canvas, l_rect,  (0, 0, 0), 2)
+
+        # Mark already-registered points in a dimmed colour.
+        dim = tuple(int(c * 0.35) for c in color)
+        for i, pt in enumerate(screen_points):
+            if i < idx:
+                _draw_point(canvas, _to_local_pt(pt, ox, oy), i, dim)
+
+        l_target = _to_local_pt(screen_points[idx], ox, oy)
+        _draw_target(canvas, l_target, idx)
+        _composite_camera_inset(canvas, undistorted, det)
+
+        prompt = [
+            f"PEN phase: {label}",
+            f"Place the pen tip on the RED target ({idx + 1}/{len(screen_points)}).",
+            "ENTER = register   U = undo   Q = abort",
+        ]
+        if det.pixel_point is None:
+            prompt.append("(pen not detected - move it into the camera's view)")
+        _draw_prompt(canvas, prompt)
+
+        cv2.imshow(WINDOW, canvas)
+        key = cv2.waitKey(15) & 0xFF
+
+        if key == ord('q'):
+            raise RuntimeError(f"Aborted in pen phase ({label}).")
+        if key == ord('u') and pixel_points:
+            pixel_points.pop()
+            idx -= 1
+            continue
+        # ENTER is 10 or 13 depending on the OpenCV build.
+        if key in (10, 13):
+            if det.pixel_point is None:
+                print("  no pen detected - cannot register this point.")
+                continue
+            pixel_points.append((float(det.pixel_point[0]),
+                                 float(det.pixel_point[1])))
+            print(f"  cam pixel {pixel_points[-1]} -> screen {screen_points[idx]}")
+            idx += 1
+
+    return pixel_points
+
+
+# ── Camera open (mirrors tracker.py's _open_camera) ──────────────────────────
+
+def _open_camera(index, width, height, fps):
+    attempts = [(cv2.CAP_DSHOW, "DSHOW"),
+                (cv2.CAP_MSMF,  "MSMF"),
+                (None,          "DEFAULT")]
+    for backend, name in attempts:
+        cap = (cv2.VideoCapture(index, backend) if backend is not None
+               else cv2.VideoCapture(index))
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FOURCC,  cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS,          fps)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        for _ in range(30):
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                print(f"cam{index} opened via {name}")
+                return cap
+        cap.release()
+    return None
+
+
+def _default_intrinsics(w, h):
+    """No-op intrinsics: identity-ish mtx, zero dist - matches calibrate.py."""
+    mtx = np.array([[float(w), 0.0,      w / 2.0],
+                    [0.0,      float(w), h / 2.0],
+                    [0.0,      0.0,      1.0    ]], dtype=np.float64)
+    dist = np.zeros(5, dtype=np.float64)
+    return mtx, dist
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.yaml")
+    args = parser.parse_args()
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    cam_cfg  = cfg["cameras"]
+    cam1_idx = cam_cfg["cam1_index"]
+    cam2_idx = cam_cfg["cam2_index"]
+    cam_w    = cam_cfg["width"]
+    cam_h    = cam_cfg["height"]
+    fps      = cam_cfg["fps"]
+
+    screen_cfg    = cfg.get("screen", {}) or {}
+    monitor_index = int(screen_cfg.get("monitor_index", 0))
+    ox, oy, mw, mh = _resolve_monitor(monitor_index)
+    monitor       = (ox, oy, mw, mh)
+    print(f"Target monitor #{monitor_index}: origin=({ox},{oy})  size={mw}x{mh}")
+
+    def_l, def_r = _default_rects(ox, oy, mw, mh)
+    rect_left    = _rect_from_cfg(screen_cfg.get("rect_left"),  def_l)
+    rect_right   = _rect_from_cfg(screen_cfg.get("rect_right"), def_r)
+    print(f"LEFT  rect (cam2): {rect_left}")
+    print(f"RIGHT rect (cam1): {rect_right}")
+
+    # Place the window on the target monitor, then ask for fullscreen. On
+    # Windows this fullscreens on whichever monitor the window currently
+    # occupies, which is how we steer the UI to a non-primary display.
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.moveWindow(WINDOW, ox, oy)
+    cv2.resizeWindow(WINDOW, mw, mh)
+    cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    cv2.imshow(WINDOW, _blank(mw, mh))
+    cv2.waitKey(50)
+
+    try:
+        print("\n=== Phase 1/4: cursor on LEFT rect (cam2) ===")
+        left_screen_pts  = collect_cursor_points(
+            monitor, rect_left, rect_right,
+            "LEFT rect (cam2)", LEFT_COLOR)
+
+        print("\n=== Phase 2/4: cursor on RIGHT rect (cam1) ===")
+        right_screen_pts = collect_cursor_points(
+            monitor, rect_right, rect_left,
+            "RIGHT rect (cam1)", RIGHT_COLOR)
+
+        # Phase 3: pen on left rect via cam2
+        print("\n=== Phase 3/4: pen on LEFT rect using cam2 ===")
+        det2 = OrangeTipDetector.from_config(cfg, cam_key="cam2")
+        cap2 = _open_camera(cam2_idx, cam_w, cam_h, fps)
+        if cap2 is None:
+            raise RuntimeError(f"could not open cam2 (index {cam2_idx})")
+        mtx2, dist2 = _default_intrinsics(cam_w, cam_h)
+        try:
+            left_pixel_pts = collect_pen_points(
+                cap2, det2, mtx2, dist2,
+                monitor, rect_left, rect_right,
+                left_screen_pts, "LEFT rect (cam2)", LEFT_COLOR)
+        finally:
+            cap2.release()
+
+        # Phase 4: pen on right rect via cam1
+        print("\n=== Phase 4/4: pen on RIGHT rect using cam1 ===")
+        det1 = OrangeTipDetector.from_config(cfg, cam_key="cam1")
+        cap1 = _open_camera(cam1_idx, cam_w, cam_h, fps)
+        if cap1 is None:
+            raise RuntimeError(f"could not open cam1 (index {cam1_idx})")
+        mtx1, dist1 = _default_intrinsics(cam_w, cam_h)
+        try:
+            right_pixel_pts = collect_pen_points(
+                cap1, det1, mtx1, dist1,
+                monitor, rect_right, rect_left,
+                right_screen_pts, "RIGHT rect (cam1)", RIGHT_COLOR)
+        finally:
+            cap1.release()
+
+    finally:
+        cv2.destroyAllWindows()
+
+    # ── Solve homographies (cam pixel -> screen pixel) ──────────────────────
+    src1 = np.array(right_pixel_pts,  dtype=np.float32)
+    dst1 = np.array(right_screen_pts, dtype=np.float32)
+    H1, mask1 = cv2.findHomography(src1, dst1, cv2.RANSAC, 5.0)
+    if H1 is None:
+        raise RuntimeError("cam1 homography solve failed - points may be degenerate.")
+    print(f"cam1 homography inliers: {int(mask1.sum())}/{len(mask1)}")
+
+    src2 = np.array(left_pixel_pts,  dtype=np.float32)
+    dst2 = np.array(left_screen_pts, dtype=np.float32)
+    H2, mask2 = cv2.findHomography(src2, dst2, cv2.RANSAC, 5.0)
+    if H2 is None:
+        raise RuntimeError("cam2 homography solve failed - points may be degenerate.")
+    print(f"cam2 homography inliers: {int(mask2.sum())}/{len(mask2)}")
+
+    out1 = "calibration/cam1_screen_calibration.npz"
+    out2 = "calibration/cam2_screen_calibration.npz"
+    np.savez(out1, mtx=mtx1, dist=dist1, H=H1,
+             rect=np.array(rect_right, dtype=np.int32),
+             rms=np.float64(0.0))
+    np.savez(out2, mtx=mtx2, dist=dist2, H=H2,
+             rect=np.array(rect_left, dtype=np.int32),
+             rms=np.float64(0.0))
+    print(f"\nSaved:\n  {out1}\n  {out2}")
+
+    # Persist the resolved rectangles back into config.yaml so subsequent
+    # runs reuse the same bounds (and so the tracker has them on hand).
+    _persist_rects_to_config(args.config, rect_left, rect_right)
+    print(f"Wrote rect_left={list(rect_left)}  rect_right={list(rect_right)}  "
+          f"into {args.config}")
+
+    print("\nSet screen.enabled: true in config.yaml to use these at runtime.")
+
+
+if __name__ == "__main__":
+    main()
