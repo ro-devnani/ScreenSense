@@ -18,11 +18,11 @@ plane:
     - 400
 detection:
   hsv_lower:
-  - 48
-  - 58
-  - 78
+  - 43
+  - 63
+  - 0
   hsv_upper:
-  - 179
+  - 88
   - 255
   - 255
   min_area: 20
@@ -30,10 +30,6 @@ detection:
   morph_kernel_size: 5
   roi_cam1: null
   roi_cam2: null
-  # Color-reliability gate (screen mode). 0.0 disables the gate; raise it
-  # to freeze the cursor when the detected blob's mean HSV is near the
-  # edge of [hsv_lower, hsv_upper] (likely a reflection, not the real pen).
-  # 0.2-0.35 is a reasonable starting range with the current HSV bounds.
   color_confidence_min: 0.25
 fusion:
   single_camera_penalty: 0.6
@@ -41,6 +37,8 @@ fusion:
 kalman:
   process_noise: 0.01
   measurement_noise: 0.1
+  screen_process_noise: 4.0
+  screen_measurement_noise: 80.0
 output:
   show_debug: true
   save_strokes: true
@@ -50,17 +48,7 @@ cursor:
   use_smoothed: true
   invert_y: false
 screen:
-  # When true, tracker.py loads cam{1,2}_screen_calibration.npz (produced by
-  # calibration/screen_calibrate.py) and maps each camera's pen detection
-  # directly to screen pixels inside its own rectangle - no plane-mm step,
-  # no two-camera fusion. cam2 -> rect_left, cam1 -> rect_right.
   enabled: true
-  # Which monitor the calibration UI and cursor target. 0 = primary,
-  # 1 = second monitor, etc. Indices are stable across runs on the same
-  # hardware as long as the display arrangement doesn't change.
   monitor_index: 1
-  # Rect bounds in screen pixels (GLOBAL coords - already include the
-  # target monitor's origin offset). Leave null to auto-fill at calibration
-  # time. Re-run calibration after changing monitor_index.
-  rect_left:  null
-  rect_right: null
+  calib_points: 8
+  rect: [1960, 40, 3800, 1040]

@@ -165,31 +165,29 @@ def initialize_tracking(cap1, cap2, cal1, cal2, detector1, detector2, cfg):
 
 def run_screen(cfg):
     """
-    Screen-mode runtime: each camera has its own homography mapping cam pixels
-    directly to screen pixels inside its rectangle (see calibration/screen_calibrate.py).
-    cam2 controls the LEFT rect, cam1 the RIGHT rect. No SensorFuser - the pen
-    is normally in only one camera's zone at a time, so we pick whichever camera
-    has the higher-confidence detection this frame.
-
-    The plane-mm pipeline and the two-camera initialization handshake do not
-    apply here, so this path is deliberately separate from run().
+    Screen-mode runtime: both cameras' homographies map their pixels into the
+    SAME on-screen rectangle (see calibration/screen_calibrate.py). The two
+    screen-pixel estimates are confidence-fused, then a SINGLE Kalman filter
+    smooths the fused position before moving the cursor. Running one Kalman
+    on the fused signal (instead of one per camera) avoids the state-jump
+    that happens when one camera takes over from the other - that was the
+    main source of cursor teleporting.
     """
-    cam_cfg    = cfg["cameras"]
-    out_cfg    = cfg["output"]
-    min_conf   = cfg["fusion"]["min_confidence"]
+    cam_cfg   = cfg["cameras"]
+    out_cfg   = cfg["output"]
+    min_conf  = cfg["fusion"]["min_confidence"]
     # Color reliability: freeze the cursor when the detected blob's mean HSV
     # sits too close to the edge of the configured range (i.e. it's marginal,
     # the kind of detection that usually turns out to be a reflection rather
     # than the actual pen). 0.0 disables the freeze.
-    color_min  = float(cfg["detection"].get("color_confidence_min", 0.0))
+    color_min = float(cfg["detection"].get("color_confidence_min", 0.0))
 
-    # cal["H"] now maps cam-pixels -> screen-pixels; cal["rect"] is that
-    # camera's screen rectangle.
+    # cal["H"] maps cam-pixels -> screen-pixels; both files store the SAME
+    # `rect`, which is the on-screen drawing area.
     cal1 = load_calibration("calibration/cam1_screen_calibration.npz")
     cal2 = load_calibration("calibration/cam2_screen_calibration.npz")
-    rect1 = cal1.get("rect")
-    rect2 = cal2.get("rect")
-    if rect1 is None or rect2 is None:
+    rect = cal1.get("rect")
+    if rect is None or cal2.get("rect") is None:
         raise RuntimeError(
             "Screen calibration .npz missing 'rect' field - re-run "
             "calibration/screen_calibrate.py."
@@ -197,14 +195,15 @@ def run_screen(cfg):
 
     detector1 = OrangeTipDetector.from_config(cfg, cam_key="cam1")
     detector2 = OrangeTipDetector.from_config(cfg, cam_key="cam2")
-    # One Kalman per camera. State is in screen pixels here, but the filter
-    # is unit-agnostic - same constant-velocity model still applies.
-    kalman1   = PenKalmanFilter.from_config(cfg)
-    kalman2   = PenKalmanFilter.from_config(cfg)
+    fuser     = SensorFuser.from_config(cfg)
+    # One Kalman on the FUSED signal. screen_mode=True picks the pixel-space
+    # noise tuning (screen_process_noise / screen_measurement_noise) -
+    # mm-tuned values are far too tight for pixel measurements and let
+    # jitter through unfiltered, which looks like teleporting.
+    kalman    = PenKalmanFilter.from_config(cfg, screen_mode=True)
 
     cursor_cfg     = cfg.get("cursor", {}) or {}
     cursor_enabled = bool(cursor_cfg.get("enabled", False))
-    use_smoothed   = bool(cursor_cfg.get("use_smoothed", False))
     cursor         = CursorController.from_config(cfg) if cursor_enabled else None
 
     start_background_listener()
@@ -223,14 +222,13 @@ def run_screen(cfg):
     print("Screen-mode tracker running. Press Q to quit.")
     prev_time = time.time()
 
+    rx0, ry0, rx1, ry1 = (int(rect[0]), int(rect[1]),
+                          int(rect[2]), int(rect[3]))
+
     def _to_screen(pixel_point, H):
         pt  = np.array([[[pixel_point[0], pixel_point[1]]]], dtype=np.float32)
         out = cv2.perspectiveTransform(pt, H)
         return float(out[0][0][0]), float(out[0][0][1])
-
-    def _clip_to_rect(sx, sy, rect):
-        x0, y0, x1, y1 = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
-        return max(x0, min(x1 - 1, sx)), max(y0, min(y1 - 1, sy))
 
     while True:
         ret1, frame1 = cap1.read()
@@ -247,35 +245,33 @@ def run_screen(cfg):
 
         # A detection contributes only if its area-confidence AND its color
         # reliability clear their respective thresholds. Marginal-color
-        # detections are filtered out here so the cursor "freezes" rather
-        # than jumping to whatever reflection slipped through the HSV range.
+        # detections are filtered out so the cursor "freezes" rather than
+        # jumping to whatever reflection slipped through the HSV range.
         ok1 = (det1.pixel_point is not None
                and det1.confidence       >= min_conf
                and det1.color_confidence >= color_min)
         ok2 = (det2.pixel_point is not None
                and det2.confidence       >= min_conf
                and det2.color_confidence >= color_min)
-        raw1 = _to_screen(det1.pixel_point, cal1["H"]) if ok1 else None
-        raw2 = _to_screen(det2.pixel_point, cal2["H"]) if ok2 else None
+        pt1  = _to_screen(det1.pixel_point, cal1["H"]) if ok1 else None
+        pt2  = _to_screen(det2.pixel_point, cal2["H"]) if ok2 else None
+        conf1 = det1.confidence if ok1 else 0.0
+        conf2 = det2.confidence if ok2 else 0.0
 
-        # Per-camera Kalman smoothing (in screen pixels).
-        sm1 = kalman1.update(measurement=raw1, confidence=det1.confidence, min_confidence=min_conf)
-        sm2 = kalman2.update(measurement=raw2, confidence=det2.confidence, min_confidence=min_conf)
+        # Fuse the two screen-pixel estimates with confidence weighting.
+        fused = fuser.fuse(pt1, conf1, pt2, conf2)
 
-        # Pick which camera drives the cursor this frame. The pen is normally
-        # only physically in one zone, so the camera that didn't see it has
-        # near-zero confidence and naturally loses the tiebreak.
-        chosen = None
-        if raw1 is not None and (raw2 is None or det1.confidence >= det2.confidence):
-            chosen = ("cam1", raw1, sm1, rect1)
-        elif raw2 is not None:
-            chosen = ("cam2", raw2, sm2, rect2)
+        # Single Kalman pass over the fused signal.
+        sx, sy = kalman.update(
+            measurement   = fused.plane_point,
+            confidence    = fused.confidence,
+            min_confidence= min_conf,
+        )
 
-        if cursor is not None and chosen is not None:
-            _, raw, sm, rect = chosen
-            sx, sy = sm if use_smoothed else raw
-            sx, sy = _clip_to_rect(sx, sy, rect)
-            cursor.move_screen(sx, sy)
+        if cursor is not None and fused.source != "lost":
+            cx = max(rx0, min(rx1 - 1, sx))
+            cy = max(ry0, min(ry1 - 1, sy))
+            cursor.move_screen(cx, cy)
 
         # ── ESP write/erase buttons -> synthetic mouse buttons ──────────────
         write_now = is_write_pressed()
@@ -301,8 +297,8 @@ def run_screen(cfg):
             half_w = w // 2
             left   = cv2.resize(frame1, (half_w, h))
             right  = cv2.resize(frame2, (half_w, h))
-            for img, det, label in ((left, det1, "CAM1->RIGHT"),
-                                    (right, det2, "CAM2->LEFT")):
+            for img, det, label in ((left, det1, "CAM1"),
+                                    (right, det2, "CAM2")):
                 ok = det.pixel_point is not None and det.confidence >= min_conf
                 color = (0, 200, 0) if ok else (0, 0, 200)
                 if det.pixel_point is not None:
@@ -313,9 +309,10 @@ def run_screen(cfg):
                             (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             combined = np.hstack([left, right])
             bar = np.zeros((40, combined.shape[1], 3), dtype=np.uint8)
-            src = chosen[0] if chosen else "lost"
-            cv2.putText(bar, f"src: {src}   FPS: {fps:.1f}", (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+            cv2.putText(bar,
+                        f"src: {fused.source:<10}  fused_conf: {fused.confidence:.2f}  "
+                        f"smoothed: ({sx:.0f},{sy:.0f})  FPS: {fps:.1f}",
+                        (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
             cv2.imshow("Pen Tracker - Screen Mode", np.vstack([combined, bar]))
 
         key = cv2.waitKey(1) & 0xFF
