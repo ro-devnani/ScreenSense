@@ -1,9 +1,7 @@
 import cv2
 import numpy as np
 import yaml
-import json
 import time
-from pathlib import Path
 
 from detect import OrangeTipDetector, Detection
 from fuse   import SensorFuser
@@ -25,6 +23,11 @@ from utils  import (
 # Number of consecutive frames both cameras must detect the pen for the
 # initialization phase to consider the system ready.
 INIT_STABLE_FRAMES = 10
+
+# Consecutive failed reads before giving up on a camera. Without a limit an
+# unplugged camera spins the loop forever, spamming warnings, with no way to
+# press Q (waitKey is never reached).
+MAX_READ_FAILURES = 100
 
 
 def _open_camera(index, cam_cfg):
@@ -89,12 +92,19 @@ def initialize_tracking(cap1, cap2, cal1, cal2, detector1, detector2, cfg):
 
     stable_count = 0
     ready        = False
+    failures     = 0
 
     while True:
         ret1, frame1 = cap1.read()
         ret2, frame2 = cap2.read()
         if not ret1 or not ret2:
+            failures += 1
+            if failures >= MAX_READ_FAILURES:
+                print("ERROR: cameras stopped delivering frames during initialization.")
+                cv2.destroyWindow(window)
+                return False
             continue
+        failures = 0
 
         frame1 = cv2.undistort(frame1, cal1["mtx"], cal1["dist"])
         frame2 = cv2.undistort(frame2, cal2["mtx"], cal2["dist"])
@@ -143,7 +153,6 @@ def initialize_tracking(cap1, cap2, cal1, cal2, detector1, detector2, cfg):
         if ready:
             msg, col = "READY  -  press SPACE to start tracking", (0, 220, 0)
         else:
-            remaining = max(INIT_STABLE_FRAMES - stable_count, 0)
             msg = (f"Hold pen steady in view of BOTH cameras "
                    f"(stable frames: {stable_count}/{INIT_STABLE_FRAMES})")
             col = (200, 200, 200)
@@ -230,12 +239,17 @@ def run_screen(cfg):
         out = cv2.perspectiveTransform(pt, H)
         return float(out[0][0][0]), float(out[0][0][1])
 
+    failures = 0
     while True:
         ret1, frame1 = cap1.read()
         ret2, frame2 = cap2.read()
         if not ret1 or not ret2:
-            print("WARNING: Frame capture failed - skipping frame.")
+            failures += 1
+            if failures >= MAX_READ_FAILURES:
+                print("ERROR: cameras stopped delivering frames - stopping.")
+                break
             continue
+        failures = 0
 
         frame1 = cv2.undistort(frame1, cal1["mtx"], cal1["dist"])
         frame2 = cv2.undistort(frame2, cal2["mtx"], cal2["dist"])
@@ -297,9 +311,10 @@ def run_screen(cfg):
             half_w = w // 2
             left   = cv2.resize(frame1, (half_w, h))
             right  = cv2.resize(frame2, (half_w, h))
-            for img, det, label in ((left, det1, "CAM1"),
-                                    (right, det2, "CAM2")):
-                ok = det.pixel_point is not None and det.confidence >= min_conf
+            # Green only when the detection passed both the area and colour
+            # gates, i.e. it actually fed the cursor.
+            for img, det, label, ok in ((left, det1, "CAM1", ok1),
+                                        (right, det2, "CAM2", ok2)):
                 color = (0, 200, 0) if ok else (0, 0, 200)
                 if det.pixel_point is not None:
                     px = int(det.pixel_point[0] * (half_w / w))
@@ -393,6 +408,7 @@ def run(config_path: str = "config.yaml"):
     print("Tracker running. Press Q to quit, S to save current stroke.")
 
     prev_time = time.time()
+    failures  = 0
 
     while True:
         # ── Capture ───────────────────────────────────────────────────────────
@@ -400,8 +416,12 @@ def run(config_path: str = "config.yaml"):
         ret2, frame2 = cap2.read()
 
         if not ret1 or not ret2:
-            print("WARNING: Frame capture failed — skipping frame.")
+            failures += 1
+            if failures >= MAX_READ_FAILURES:
+                print("ERROR: cameras stopped delivering frames - stopping.")
+                break
             continue
+        failures = 0
 
         # ── Undistort ─────────────────────────────────────────────────────────
         # Removes lens barrel/pincushion distortion using the intrinsic
@@ -484,8 +504,10 @@ def run(config_path: str = "config.yaml"):
         if key == ord('q'):
             break
         elif key == ord('s'):
+            # Count before saving: save_stroke() empties current_stroke.
+            n_points = len(recorder.current_stroke)
             recorder.save_stroke()
-            print(f"Stroke saved ({len(recorder.current_stroke)} points)")
+            print(f"Stroke saved ({n_points} points)")
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     # Release any synthetic buttons that might still be held down so the OS

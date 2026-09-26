@@ -26,10 +26,14 @@ Tool-selection mapping (ESP32 -> overlay):
 The first non-pointer state also shows the overlay if it is hidden, so
 the ESP32 can bring up the UI without the user also pressing W.
 
-Mouse-button mapping (ESP32 -> synthetic mouse, in the tracker thread):
+Mouse-button mapping (ESP32 -> synthetic mouse, on the Qt thread):
 
-    write transitions  -> left mouse down / up  (drives the pen stroke)
-    erase transitions  -> right mouse down / up
+    either button down -> left mouse down (the selected tool - pen or
+                          eraser - acts on the drag)
+    both buttons up    -> left mouse up
+
+The press is issued after the tool switch / overlay show, so it lands on
+the overlay rather than on whatever window is underneath.
 
 Run from the project root:
     python esp32_overlay_bridge.py
@@ -62,8 +66,9 @@ from src.cursor import CursorController
 from src.utils import load_calibration
 
 
-POLL_INTERVAL_MS = 33   # ~30 Hz: fast enough to feel instant on a button press
-CONFIG_PATH      = "config.yaml"
+POLL_INTERVAL_MS  = 33   # ~30 Hz: fast enough to feel instant on a button press
+CONFIG_PATH       = "config.yaml"
+MAX_READ_FAILURES = 100  # consecutive failed camera reads before giving up
 
 
 # ── ESP32 -> overlay tool selection ──────────────────────────────────────────
@@ -79,16 +84,27 @@ def _tool_for(erase, write):
     return "scroll"
 
 
-def _make_state_handler(overlay):
+def _make_state_handler(overlay, cursor):
     """Closure that only acts on transitions of (erase, write). Acting only
     on transitions means a manual tool change from the on-screen toolbar
     sticks until the ESP32 state actually changes again, instead of being
-    overwritten every poll tick."""
+    overwritten every poll tick.
+
+    `cursor` (a CursorController, or None when cursor control is off) turns
+    button presses into synthetic left-mouse down/up events."""
     last_erase = None
     last_write = None
+    pressed    = False
+
+    def release():
+        """Let go of the synthetic mouse button if we're holding it."""
+        nonlocal pressed
+        if cursor is not None and pressed:
+            cursor.left_up()
+        pressed = False
 
     def tick():
-        nonlocal last_erase, last_write
+        nonlocal last_erase, last_write, pressed
         erase = input_receiver.is_erase_pressed()
         write = input_receiver.is_write_pressed()
         if erase == last_erase and write == last_write:
@@ -104,6 +120,14 @@ def _make_state_handler(overlay):
         print(f"[esp32] write={write} erase={erase} -> tool={tool} "
               f"overlay_on={overlay.overlay_on}", flush=True)
 
+        # Both the pen and the eraser act on a left-button drag, so either
+        # ESP32 button presses the left button (the overlay ignores the
+        # right button entirely). Release before switching tools so the
+        # mouse-up is queued ahead of the switch to scroll mode.
+        down = write or erase
+        if not down:
+            release()
+
         # Auto-show the overlay the first time the user picks a drawing
         # tool, so they don't also have to press W. Don't auto-show for
         # pure pointer mode - if both buttons are off and the overlay was
@@ -114,6 +138,13 @@ def _make_state_handler(overlay):
         if overlay.overlay_on:
             overlay.select_tool(tool)
 
+        # Press after the tool switch / overlay show so the press lands on
+        # the overlay, not on the window underneath it.
+        if cursor is not None and down and not pressed:
+            cursor.left_down()
+            pressed = True
+
+    tick.release = release
     return tick
 
 
@@ -151,9 +182,9 @@ def _open_camera(index, cam_cfg):
 
 def _run_camera_tracker(cfg, stop_event):
     """Headless port of tracker.run_screen(): two cameras -> detection ->
-    confidence fusion -> single Kalman -> Win32 SetCursorPos. ESP32 write/
-    erase transitions become synthetic mouse buttons so the overlay sees
-    real mouseDown / mouseUp events at the tracked cursor position.
+    confidence fusion -> single Kalman -> Win32 SetCursorPos. Mouse buttons
+    are handled on the Qt thread (see _make_state_handler); this thread only
+    moves the cursor.
 
     A cv2 debug window mirrors tracker.run_screen()'s preview (both camera
     frames side-by-side with detection overlays + a status bar). cv2 GUI
@@ -203,8 +234,6 @@ def _run_camera_tracker(cfg, stop_event):
         return
 
     rx0, ry0, rx1, ry1 = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
-    prev_write = False
-    prev_erase = False
 
     def _to_screen(pixel_point, H):
         pt  = np.array([[[pixel_point[0], pixel_point[1]]]], dtype=np.float32)
@@ -215,13 +244,20 @@ def _run_camera_tracker(cfg, stop_event):
     if show_debug:
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
     prev_time = time.time()
+    failures  = 0
 
     try:
         while not stop_event.is_set():
             ret1, frame1 = cap1.read()
             ret2, frame2 = cap2.read()
             if not ret1 or not ret2:
+                # Give up on an unplugged camera instead of spinning forever.
+                failures += 1
+                if failures >= MAX_READ_FAILURES:
+                    print("[tracker] cameras stopped delivering frames.", flush=True)
+                    break
                 continue
+            failures = 0
 
             frame1 = cv2.undistort(frame1, cal1["mtx"], cal1["dist"])
             frame2 = cv2.undistort(frame2, cal2["mtx"], cal2["dist"])
@@ -250,23 +286,6 @@ def _run_camera_tracker(cfg, stop_event):
                 cx = max(rx0, min(rx1 - 1, sx))
                 cy = max(ry0, min(ry1 - 1, sy))
                 cursor.move_screen(cx, cy)
-
-            # ESP32 write/erase transitions -> synthetic mouse buttons. The
-            # overlay reads these as mouseDown / mouseUp events and starts /
-            # ends the pen stroke. Tool selection (pen vs eraser) is handled
-            # separately by the QTimer-driven tick in _make_state_handler.
-            write_now = input_receiver.is_write_pressed()
-            erase_now = input_receiver.is_erase_pressed()
-            if cursor is not None:
-                if write_now and not prev_write:
-                    cursor.left_down()
-                elif prev_write and not write_now:
-                    cursor.left_up()
-                if erase_now and not prev_erase:
-                    cursor.right_down()
-                elif prev_erase and not erase_now:
-                    cursor.right_up()
-            prev_write, prev_erase = write_now, erase_now
 
             # ── Debug preview (side-by-side cameras + status bar) ──────────
             now = time.time()
@@ -321,11 +340,6 @@ def _run_camera_tracker(cfg, stop_event):
     except Exception as exc:
         print(f"[tracker] crashed: {exc}", flush=True)
     finally:
-        # Release any synthetic buttons that might still be held down so
-        # quitting mid-press doesn't leave the OS with a stuck mouse.
-        if cursor is not None:
-            if prev_write: cursor.left_up()
-            if prev_erase: cursor.right_up()
         cap1.release()
         cap2.release()
         if show_debug:
@@ -349,13 +363,17 @@ def main():
 
     input_receiver.start_background_listener()
 
-    # ESP32 -> overlay tool, polled on the Qt main thread.
+    cursor_enabled = bool((cfg.get("cursor") or {}).get("enabled", False))
+    cursor = CursorController.from_config(cfg) if cursor_enabled else None
+
+    # ESP32 -> overlay tool + mouse button, polled on the Qt main thread.
+    state_handler = _make_state_handler(overlay, cursor)
     tool_timer = QTimer()
     tool_timer.setInterval(POLL_INTERVAL_MS)
-    tool_timer.timeout.connect(_make_state_handler(overlay))
+    tool_timer.timeout.connect(state_handler)
     tool_timer.start()
 
-    # Camera tracker -> cursor + mouse buttons, daemon thread so it dies
+    # Camera tracker -> cursor position, daemon thread so it dies
     # with the process if the user closes the Qt window. stop_event lets
     # the loop break out cleanly on aboutToQuit (camera release runs).
     stop_event = threading.Event()
@@ -364,6 +382,8 @@ def main():
     )
     tracker_thread.start()
     app.aboutToQuit.connect(stop_event.set)
+    # Don't leave the OS with a stuck mouse button if we quit mid-press.
+    app.aboutToQuit.connect(state_handler.release)
 
     sys.exit(app.exec())
 

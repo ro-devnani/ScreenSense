@@ -118,11 +118,13 @@ class PenKalmanFilter:
             meas_array = np.array(
                 [[measurement[0]], [measurement[1]]], dtype=np.float32
             )
+            # State vectors are (4, 1) column arrays; index both axes because
+            # NumPy 2 refuses float() on a 1-element array.
             corrected = self.kf.correct(meas_array)
-            x, y = float(corrected[0]), float(corrected[1])
+            x, y = float(corrected[0, 0]), float(corrected[1, 0])
         else:
             # No valid measurement — use pure prediction (coasting)
-            x, y = float(predicted[0]), float(predicted[1])
+            x, y = float(predicted[0, 0]), float(predicted[1, 0])
 
         return (x, y)
 

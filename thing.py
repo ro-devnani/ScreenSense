@@ -44,8 +44,8 @@ from PyQt6.QtWidgets import (
 )
 
 
-ANTHROPIC_API_KEY = ""
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = "claude-opus-5"
 CLAUDE_IMAGE_LIMIT_BYTES = 3_600_000
 BOOKMARKS_DIR = Path(__file__).resolve().parent / "smartboard_bookmarks"
 DEBUG_CAPTURE_DIR = Path(__file__).resolve().parent / "smartboard_debug_captures"
@@ -828,7 +828,9 @@ class SmartboardOverlay(QWidget):
             self.ai_bridge.result_ready.emit(tool, "Install the Anthropic package first: pip install anthropic")
             return
         if claude_client is None:
-            self.ai_bridge.result_ready.emit(tool, "Claude API key is not configured.")
+            self.ai_bridge.result_ready.emit(
+                tool, "Claude API key is not configured. Set the ANTHROPIC_API_KEY environment variable and restart."
+            )
             return
 
         try:
@@ -837,9 +839,14 @@ class SmartboardOverlay(QWidget):
                 self.ai_bridge.result_ready.emit(tool, "Could not compress the selected image under Claude's image limit.")
                 return
 
-            response = claude_client.messages.create(
+            # fallbacks="default": if a safety classifier declines the request,
+            # the API retries it on Anthropic's recommended fallback model
+            # instead of returning a refusal.
+            response = claude_client.beta.messages.create(
                 model=CLAUDE_MODEL,
-                max_tokens=900,
+                max_tokens=16000,
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
                 messages=[
                     {
                         "role": "user",
@@ -857,6 +864,9 @@ class SmartboardOverlay(QWidget):
                     }
                 ],
             )
+            if response.stop_reason == "refusal":
+                self.ai_bridge.result_ready.emit(tool, "Claude declined to answer this request.")
+                return
             self.ai_bridge.result_ready.emit(tool, self.extract_claude_text(response) or "No answer returned.")
         except Exception as exc:
             self.ai_bridge.result_ready.emit(tool, f"Claude error: {exc}")
@@ -941,10 +951,10 @@ class SmartboardOverlay(QWidget):
         self.ai_title.setText(title)
         self.ai_title.setStyleSheet(f"color: {accent};")
         self.ai_body.setHtml(
-            f"""
+            """
             <div style="font-family: Arial, sans-serif; color: #eef6ff;">
                 <p style="font-size: 16px; line-height: 1.45; margin: 0;">
-                    Analyzing...w
+                    Analyzing...
                 </p>
             </div>
             """

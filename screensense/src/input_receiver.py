@@ -27,33 +27,49 @@ _button_states = {
 _state_lock = threading.Lock()
 
 
+def _release_all():
+    """Mark every button as released."""
+    with _state_lock:
+        for name in _button_states:
+            _button_states[name] = False
+
+
 def _internal_socket_worker():
     """Background worker — accepts connections from the ESP and parses JSON
     lines into the shared button-state dict."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((HOST, PORT))
+        try:
+            server_socket.bind((HOST, PORT))
+        except OSError as exc:
+            print(f"[InputReceiver] Could not listen on port {PORT}: {exc}. "
+                  f"ESP32 buttons are disabled for this run.", flush=True)
+            return
         server_socket.listen(1)
         print(f"[InputReceiver] Listening on port {PORT}")
 
         while True:
             try:
                 conn, addr = server_socket.accept()
-                buffer = ""
+                # Buffer raw bytes and decode per line so a multi-byte UTF-8
+                # character split across two recv() calls can't raise.
+                buffer = b""
                 with conn:
                     while True:
-                        data = conn.recv(1024).decode('utf-8')
+                        data = conn.recv(1024)
                         if not data:
                             break  # Client disconnected; wait for reconnect.
 
                         buffer += data
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
                             if not line.strip():
                                 continue
                             try:
-                                incoming = json.loads(line)
-                            except json.JSONDecodeError:
+                                incoming = json.loads(line.decode("utf-8"))
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                continue
+                            if not isinstance(incoming, dict):
                                 continue
                             with _state_lock:
                                 _button_states["erase"] = bool(incoming.get("erase", False))
@@ -62,6 +78,11 @@ def _internal_socket_worker():
                 # Brief pause on connection errors before retrying so a hot
                 # loop can't peg the CPU when the network is misbehaving.
                 time.sleep(1)
+            finally:
+                # If the ESP drops (power, Wi-Fi) while a button is held, its
+                # release is never sent. Without this the synthetic mouse
+                # button would stay pressed until the ESP reconnects.
+                _release_all()
 
 
 def start_background_listener():

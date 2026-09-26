@@ -75,6 +75,7 @@ class OrangeTipDetector:
 
         Returns a Detection object. If no valid blob is found, pixel_point is
         None and confidence is 0.0, but mask is still returned for debugging.
+        The returned mask always has the full frame's size, even with an ROI.
         """
         # ── Step 1: Optionally crop to ROI ───────────────────────────────────
         if self.roi is not None:
@@ -84,6 +85,15 @@ class OrangeTipDetector:
         else:
             region     = frame
             roi_offset = (0, 0)
+
+        def full_mask(roi_mask):
+            # Callers overlay / hstack the mask against the full frame, so an
+            # ROI-sized mask would fail there with a size mismatch.
+            if self.roi is None:
+                return roi_mask
+            out = np.zeros(frame.shape[:2], dtype=np.uint8)
+            out[y0:y0 + roi_mask.shape[0], x0:x0 + roi_mask.shape[1]] = roi_mask
+            return out
 
         # ── Step 2: BGR → HSV ─────────────────────────────────────────────────
         # HSV separates hue (color identity) from saturation and brightness.
@@ -115,7 +125,7 @@ class OrangeTipDetector:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
-            return Detection(pixel_point=None, confidence=0.0, mask=mask, area=0.0)
+            return Detection(pixel_point=None, confidence=0.0, mask=full_mask(mask), area=0.0)
 
         # Pick the largest blob — the pen tip should always be the dominant
         # orange object in the frame when using a black background
@@ -124,7 +134,7 @@ class OrangeTipDetector:
 
         if area < self.min_area:
             # Blob exists but is too small — likely a reflection or noise artifact
-            return Detection(pixel_point=None, confidence=0.0, mask=mask, area=area)
+            return Detection(pixel_point=None, confidence=0.0, mask=full_mask(mask), area=area)
 
         # ── Step 6: Locate the tip (not the centroid) ─────────────────────────
         # The centroid of an orange pen body is in the middle of the shaft,
@@ -138,7 +148,9 @@ class OrangeTipDetector:
 
         # Aspect ratio of variances along the two principal axes.
         # >> 1.0 means an elongated blob.
-        long_var, short_var = float(eigvals[0]), float(eigvals[1])
+        # eigvals has shape (2, 1); index both axes because NumPy 2 refuses
+        # float() on a 1-element array.
+        long_var, short_var = float(eigvals[0, 0]), float(eigvals[1, 0])
         elongation = (long_var / short_var) if short_var > 1e-6 else float('inf')
 
         if elongation > 2.0:
@@ -174,13 +186,18 @@ class OrangeTipDetector:
         # that the blob is genuinely the pen and not a marginal range-edge
         # match (which is what reflections and stray bright spots tend to
         # be). Returns 1.0 at range center on every channel, 0.0 at any edge.
-        mean_h, mean_s, mean_v = cv2.mean(hsv, mask=mask)[:3]
+        # Only the chosen blob is sampled, so a stray reflection elsewhere in
+        # the mask can't drag the pen's score up or down.
+        blob_mask = np.zeros_like(mask)
+        cv2.drawContours(blob_mask, [best], -1, 255, thickness=cv2.FILLED)
+        blob_mask &= mask
+        mean_h, mean_s, mean_v = cv2.mean(hsv, mask=blob_mask)[:3]
         color_confidence = self._color_confidence(mean_h, mean_s, mean_v)
 
         return Detection(
             pixel_point=(full_cx, full_cy),
             confidence=confidence,
-            mask=mask,
+            mask=full_mask(mask),
             area=area,
             color_confidence=color_confidence,
             mean_hsv=(float(mean_h), float(mean_s), float(mean_v)),

@@ -14,11 +14,17 @@ Keys:
 """
 
 import argparse
+import os
+import sys
 import time
 
 import cv2
 import numpy as np
 import yaml
+
+# Allow `from src.utils import ...` when run from the project root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.utils import set_config_list
 
 
 def open_camera(index, width, height, fps):
@@ -118,10 +124,11 @@ def run(cam_index, config_path="config.yaml"):
         if key == ord('q'):
             break
         elif key == ord('s'):
-            cfg["detection"]["hsv_lower"] = lower.tolist()
-            cfg["detection"]["hsv_upper"] = upper.tolist()
-            with open(config_path, "w") as f:
-                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+            # Edit just these two lines. Re-dumping the whole file with
+            # yaml.dump would drop comments and turn `rect: [...]` into a
+            # block list, which screen_calibrate.py then couldn't rewrite.
+            set_config_list(config_path, "hsv_lower", lower.tolist())
+            set_config_list(config_path, "hsv_upper", upper.tolist())
             print(f"saved: lower={lower.tolist()}  upper={upper.tolist()}")
 
     cap.release()

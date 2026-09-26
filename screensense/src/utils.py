@@ -1,9 +1,9 @@
 import cv2
 import numpy as np
 import json
-import math
+import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Sequence, Tuple
 
 
 # ── Calibration I/O ──────────────────────────────────────────────────────────
@@ -24,6 +24,28 @@ def load_calibration(path: str) -> dict:
         "rms"  : float(data["rms"]),
         "rect" : data["rect"] if "rect" in data.files else None,
     }
+
+
+# ── Config I/O ────────────────────────────────────────────────────────────────
+
+def set_config_list(config_path: str, key: str, values: Sequence[int]) -> bool:
+    """
+    Rewrite the value of `key:` in config.yaml as a flow list ([a, b, c]),
+    leaving every other line (including comments) untouched.
+
+    Handles both flow style (`key: [1, 2]`) and block style (`key:` followed
+    by `- 1` lines), so tools that edit the same file can't leave orphaned
+    list items behind. Returns False if the key isn't present.
+    """
+    fmt = "[" + ", ".join(str(int(v)) for v in values) + "]"
+    with open(config_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    pattern = rf"(?m)^([ \t]*{re.escape(key)}:)[^\n]*(?:\n[ \t]*-[^\n]*)*"
+    text, count = re.subn(pattern, lambda m: f"{m.group(1)} {fmt}", text, count=1)
+    if count:
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    return bool(count)
 
 
 # ── Coordinate mapping ────────────────────────────────────────────────────────
@@ -77,15 +99,16 @@ def draw_debug_overlay(
     overlay2  = cv2.addWeighted(frame2, 0.6, mask2_rgb, 0.4, 0)
 
     # Draw detected centroid circles
-    for overlay, det, pt, label in [
-        (overlay1, det1, pt1, "CAM1"),
-        (overlay2, det2, pt2, "CAM2"),
+    for overlay, det, label in [
+        (overlay1, det1, "CAM1"),
+        (overlay2, det2, "CAM2"),
     ]:
         color = (0, 255, 0) if det.pixel_point else (0, 0, 255)
         if det.pixel_point:
             cv2.circle(overlay, (int(det.pixel_point[0]), int(det.pixel_point[1])),
                        8, color, 2)
-        conf_text = f"{label}  conf={det.confidence:.2f}  area={det.area:.0f}px²"
+        # Hershey fonts are ASCII-only; a "²" here renders as "??".
+        conf_text = f"{label}  conf={det.confidence:.2f}  area={det.area:.0f}px^2"
         cv2.putText(overlay, conf_text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 

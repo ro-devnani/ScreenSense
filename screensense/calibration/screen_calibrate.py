@@ -34,7 +34,6 @@ phase ends - it never persists beyond this script.
 """
 
 import os
-import re
 import sys
 import cv2
 import numpy as np
@@ -45,6 +44,7 @@ import ctypes
 # Allow `from src.detect import ...` when run from the project root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.detect import OrangeTipDetector
+from src.utils import set_config_list
 
 
 WINDOW    = "Screen Calibration"
@@ -166,18 +166,6 @@ def _to_local_rect(rect, ox, oy):
 
 def _to_local_pt(pt, ox, oy):
     return (pt[0] - ox, pt[1] - oy)
-
-
-def _persist_rect_to_config(config_path, rect):
-    """In-place rewrite of the `rect:` line under `screen:` so the resolved
-    rectangle survives across runs. Uses line-targeted regex so YAML
-    comments and unrelated keys are preserved (unlike yaml.dump)."""
-    fmt = f"[{int(rect[0])}, {int(rect[1])}, {int(rect[2])}, {int(rect[3])}]"
-    with open(config_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    text = re.sub(r'(?m)^(\s*rect:\s*).*$', lambda m: m.group(1) + fmt, text)
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(text)
 
 
 # ── Drawing primitives ───────────────────────────────────────────────────────
@@ -516,8 +504,11 @@ def main():
 
     # Persist the resolved rectangle back into config.yaml so subsequent
     # runs reuse the same bounds (and so the tracker has them on hand).
-    _persist_rect_to_config(args.config, rect)
-    print(f"Wrote rect={list(rect)} into {args.config}")
+    if set_config_list(args.config, "rect", rect):
+        print(f"Wrote rect={list(rect)} into {args.config}")
+    else:
+        print(f"NOTE: no `rect:` key under `screen:` in {args.config}; add "
+              f"`rect: {list(rect)}` there to reuse these bounds.")
 
     print("\nSet screen.enabled: true in config.yaml to use these at runtime.")
 

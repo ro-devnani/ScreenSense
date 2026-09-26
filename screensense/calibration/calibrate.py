@@ -212,7 +212,13 @@ def compute_homography(cam_index, mtx, dist, width, height, plane_corners_mm, cf
 
     # findHomography: maps FROM pixel coords TO plane mm coords
     H, mask = cv2.findHomography(pixel_pts, plane_pts, cv2.RANSAC, 5.0)
-    print(f"  Homography computed. Inlier ratio: {mask.sum()}/{len(mask)}")
+    if H is None:
+        # Happens when corners are collinear or duplicated (e.g. the pen
+        # never moved between ENTER presses). Saving None would produce an
+        # .npz the tracker can't load.
+        raise RuntimeError("Homography solve failed - the four corners are "
+                           "degenerate. Re-run and spread them around the plane.")
+    print(f"  Homography computed. Inlier ratio: {int(mask.sum())}/{len(mask)}")
     return H
 
 # ── Entry point ───────────────────────────────────────────────────────────────
