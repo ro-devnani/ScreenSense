@@ -1,0 +1,14 @@
+# Camera tracker, calibration and tools
+opencv-python>=4.8
+numpy>=1.24
+pyyaml>=6.0
+
+# Smartboard overlay and ESP32 bridge
+PyQt6>=6.5
+pynput>=1.7
+Pillow>=10.0
+anthropic>=1.8
+
+# macOS overlay (overlay_macos.py)
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"

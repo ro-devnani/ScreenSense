@@ -526,4 +526,7 @@ def run(config_path: str = "config.yaml"):
 
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"ERROR: {exc}")

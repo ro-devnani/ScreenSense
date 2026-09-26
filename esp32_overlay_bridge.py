@@ -3,7 +3,7 @@ ESP32 + camera tracker + smartboard overlay - single entry point.
 
 This wires three things together:
 
-  1. The smartboard overlay (smartboard_camera_merge_candidate.py) shown
+  1. The smartboard overlay (overlay.py) shown
      on the main Qt thread, spanning every connected monitor.
   2. The ESP32 button receiver (src/input_receiver.py) - a TCP server on
      port 65432 listening for {"erase": bool, "write": bool} JSON lines.
@@ -56,7 +56,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Import the overlay module FIRST so its top-level Windows DPI-awareness
 # call runs before we create QApplication; without that, the overlay
 # geometry is wrong on the secondary monitor.
-import smartboard_camera_merge_candidate as overlay_module
+import overlay as overlay_module
 
 from src import input_receiver
 from src.detect import OrangeTipDetector

@@ -1,37 +1,64 @@
+"""
+ScreenSense smartboard overlay (Windows).
+
+A transparent, always-on-top window spanning every monitor. Press W to
+freeze the screen and draw on it; the sidebar has pen, highlighter, eraser,
+and AI tools (solve, similar questions, translate) that send the boxed part
+of the frozen screen to Claude. Requires ANTHROPIC_API_KEY for the AI tools.
+
+Run on its own:
+    python overlay.py
+or together with the camera tracker and ESP32 buttons:
+    python esp32_overlay_bridge.py
+"""
+
 import base64
+import ctypes
 import html
 import math
 import os
 import re
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
-os.environ["QT_MAC_WANTS_LAYER"] = "1"
+# Tell Windows we'll handle our own DPI scaling. Without this, Qt receives
+# coordinates from a virtualised "compatibility" coordinate space and the
+# overlay's geometry math is off on the secondary monitor (the overlay
+# ends up sized for the primary monitor's logical resolution and never
+# crosses the boundary). Must run BEFORE QApplication is created, hence
+# module-level rather than tucked inside __main__.
+if sys.platform == "win32":
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2, available since Windows 8.1.
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
 
 try:
     from anthropic import Anthropic
 except ImportError:
     Anthropic = None
 
+# Windows screenshot path: Pillow's ImageGrab supports `all_screens=True`
+# for virtual-desktop capture across every monitor. If Pillow isn't
+# installed, the overlay still runs but the AI tools can't snapshot
+# the screen and we surface a clear hint.
 try:
-    import AppKit
+    from PIL import ImageGrab
 except ImportError:
-    AppKit = None
-
-try:
-    import Quartz
-except ImportError:
-    Quartz = None
+    ImageGrab = None
 
 from pynput import keyboard
 from PyQt6.QtCore import QByteArray, QBuffer, QIODevice, QObject, QPoint, QRect, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -123,7 +150,12 @@ class SmartboardOverlay(QWidget):
         self.start_hotkey_listener()
 
     def configure_window(self):
-        self.setWindowTitle("ScreenSense Smartboard Overlay")
+        self.setWindowTitle("ScreenSense Overlay")
+        # On Windows, FramelessWindowHint + WindowStaysOnTopHint + Tool gives
+        # us a click-through-capable overlay that floats above normal windows
+        # and stays out of the taskbar. WA_TranslucentBackground gives us the
+        # transparent canvas. NoDropShadowWindowHint avoids the system shadow
+        # bleeding around the frameless rect.
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -142,58 +174,72 @@ class SmartboardOverlay(QWidget):
         self.setStyleSheet("background: transparent;")
         self.winId()
         self.move_to_all_screens()
-        self.apply_macos_overlay_behavior()
 
-    def move_to_all_screens(self):
+    def _virtual_screen_rect(self):
+        """Bounding rect of every connected monitor in global pixel coords.
+        Uses raw Win32 GetSystemMetrics on Windows - Qt's screen geometry
+        can return scaled values when monitors have different DPI factors
+        even with PROCESS_PER_MONITOR_DPI_AWARE, which makes the overlay
+        come up sized for the primary monitor only."""
+        if sys.platform == "win32":
+            try:
+                user32 = ctypes.windll.user32
+                # SM_{X,Y,CX,CY}VIRTUALSCREEN = 76, 77, 78, 79.
+                return QRect(
+                    int(user32.GetSystemMetrics(76)),
+                    int(user32.GetSystemMetrics(77)),
+                    int(user32.GetSystemMetrics(78)),
+                    int(user32.GetSystemMetrics(79)),
+                )
+            except Exception as exc:
+                print(f"GetSystemMetrics fallback: {exc}", flush=True)
+
         screens = QApplication.screens()
         if not screens:
-            return
-
-        geometry = QRect(screens[0].geometry())
-        for screen in screens[1:]:
-            geometry = geometry.united(screen.geometry())
-        self.setGeometry(geometry)
-
-    def macos_window(self):
-        if sys.platform != "darwin" or AppKit is None:
             return None
-        try:
-            for window in AppKit.NSApp.windows():
-                if str(window.title()) == self.windowTitle():
-                    return window
-        except Exception:
-            return None
-        return None
+        return screens[0].virtualGeometry()
 
-    def apply_macos_overlay_behavior(self):
-        window = self.macos_window()
-        if window is None:
+    def move_to_all_screens(self):
+        rect = self._virtual_screen_rect()
+        if rect is None:
             return
-        try:
-            behavior = 0
-            for name in (
-                "NSWindowCollectionBehaviorCanJoinAllSpaces",
-                "NSWindowCollectionBehaviorFullScreenAuxiliary",
-                "NSWindowCollectionBehaviorStationary",
-                "NSWindowCollectionBehaviorIgnoresCycle",
-            ):
-                behavior |= getattr(AppKit, name, 0)
-            level = getattr(
-                AppKit,
-                "NSScreenSaverWindowLevel",
-                getattr(AppKit, "NSStatusWindowLevel", getattr(AppKit, "NSFloatingWindowLevel", 3)),
-            )
-            window.setOpaque_(False)
-            window.setHasShadow_(False)
-            window.setIgnoresMouseEvents_(False)
-            window.setCollectionBehavior_(behavior)
-            window.setLevel_(level)
-            window.setReleasedWhenClosed_(False)
-            if hasattr(window, "setHidesOnDeactivate_"):
-                window.setHidesOnDeactivate_(False)
-            window.orderFrontRegardless()
-        except Exception as exc:
-            print(f"macOS overlay warning: {exc}", flush=True)
+        self.setGeometry(rect)
+        self.move(rect.topLeft())
+        self.resize(rect.size())
+        # On Windows, frameless+topmost tool windows are occasionally
+        # re-snapped to the primary monitor by the DWM after Qt's
+        # setGeometry. Bypass Qt with the raw SetWindowPos call to lock
+        # the HWND across the full virtual desktop. SWP_NOACTIVATE keeps
+        # focus on whatever the user was using; SWP_FRAMECHANGED forces
+        # the new rect to take effect immediately.
+        if sys.platform == "win32":
+            try:
+                hwnd = int(self.winId())
+                HWND_TOPMOST     = -1
+                SWP_NOACTIVATE   = 0x0010
+                SWP_FRAMECHANGED = 0x0020
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, HWND_TOPMOST,
+                    rect.x(), rect.y(), rect.width(), rect.height(),
+                    SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                )
+            except Exception as exc:
+                print(f"SetWindowPos warning: {exc}", flush=True)
+
+        # Diagnostic: lets us tell whether the overlay's "stuck on primary"
+        # is caused by a wrong target rect (virt mismatch) or by Windows
+        # ignoring our setGeometry/SetWindowPos. Compare `target` to
+        # `actual` to find out.
+        actual = self.geometry()
+        screens = [f"({s.geometry().x()},{s.geometry().y()} "
+                   f"{s.geometry().width()}x{s.geometry().height()})"
+                   for s in QApplication.screens()]
+        print(
+            f"[overlay] target={rect.x()},{rect.y()} {rect.width()}x{rect.height()} | "
+            f"actual={actual.x()},{actual.y()} {actual.width()}x{actual.height()} | "
+            f"Qt screens={','.join(screens)}",
+            flush=True,
+        )
 
     def build_sidebar(self):
         self.sidebar = QFrame(self)
@@ -214,15 +260,20 @@ class SmartboardOverlay(QWidget):
         layout.setSpacing(9)
         self.sidebar.setLayout(layout)
 
+        # Icons use Unicode glyphs covered by Segoe UI Emoji (Windows 10+).
+        # Each tuple: (internal name, glyph, hover tooltip). The internal
+        # names are stable - everything else (select_tool, the ESP32
+        # bridge, paint code) keys off them, so don't rename.
         buttons = [
-            ("menu", "☰", "Collapse menu"),
-            ("pen", "✎", "Draw pen"),
-            ("eraser", "⌫", "Erase"),
-            ("highlight", "▰", "Highlight"),
-            ("similar", "?", "Box a problem and generate similar questions"),
-            ("solve", "□", "Box a problem and solve step by step"),
-            ("translate", "🌐", "Box text and translate"),
-            ("clear", "×", "Clear overlay drawings"),
+            ("menu",      "☰",   "Collapse menu"),                                # ☰
+            ("scroll",    "\U0001F5B1", "Cursor mode - use laptop normally"),          # 🖱
+            ("pen",       "✏",   "Draw pen"),                                      # ✏
+            ("eraser",    "⌫",   "Erase strokes"),                                 # ⌫
+            ("highlight", "\U0001F58D", "Highlight"),                                   # 🖍
+            ("similar",   "?",        "Box a problem and generate similar questions"),
+            ("solve",     "⚡",   "Box a problem and solve step by step"),          # ⚡
+            ("translate", "\U0001F310", "Box text and translate"),                      # 🌐
+            ("clear",     "✕",   "Clear overlay drawings"),                        # ✕
         ]
 
         self.buttons: dict[str, QPushButton] = {}
@@ -232,7 +283,9 @@ class SmartboardOverlay(QWidget):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             button.setFixedSize(54, 46)
-            button.setFont(QFont("Apple Color Emoji" if name == "translate" else "Arial", 17, QFont.Weight.Bold))
+            # Segoe UI Emoji covers both the BMP symbols and the SMP emoji
+            # used above. Falls back gracefully if it isn't installed.
+            button.setFont(QFont("Segoe UI Emoji", 17, QFont.Weight.Bold))
             button.clicked.connect(lambda checked=False, selected=name: self.select_tool(selected))
             layout.addWidget(button)
             self.buttons[name] = button
@@ -276,7 +329,7 @@ class SmartboardOverlay(QWidget):
         self.ai_panel.setLayout(layout)
 
         self.ai_title = QLabel("ScreenSense AI")
-        self.ai_title.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+        self.ai_title.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
         layout.addWidget(self.ai_title)
 
         self.ai_body = QTextBrowser()
@@ -328,17 +381,51 @@ class SmartboardOverlay(QWidget):
             self.toggle_sidebar()
             return
         if name == "clear":
+            self.exit_scroll_mode()
             self.strokes.clear()
             self.ai_boxes.clear()
             self.pending_ai_box = None
             self.ai_busy = False
             self.ai_panel.hide()
+            self.tool = "pen"
+            self.refresh_buttons()
             self.update()
+            return
+        if name == "scroll":
+            self.enter_scroll_mode()
             return
         if name == "translate":
             self.translation_target = "English"
+        self.exit_scroll_mode()
+        if self.drawing and name != self.tool:
+            # Tool changed mid-drag (e.g. ESP32 write -> erase): keep what was
+            # drawn so far and carry on the drag with the new tool.
+            self.finish_stroke()
+            self.start = QPoint(self.preview)
+            self.current_points = [QPoint(self.preview)]
         self.tool = name
         self.refresh_buttons()
+
+    def enter_scroll_mode(self):
+        # The ESP32 bridge switches to scroll mode when the pen button is
+        # released, and that can reach us before the mouse-up event does.
+        # Commit the stroke here so it isn't thrown away.
+        if self.drawing:
+            self.finish_stroke()
+        self.tool = "scroll"
+        self.drawing = False
+        self.current_points.clear()
+        self.refresh_buttons()
+        self.apply_scroll_mode_mask()
+        self.update()
+
+    def exit_scroll_mode(self):
+        self.clearMask()
+
+    def apply_scroll_mode_mask(self):
+        self.clearMask()
+        sidebar_rect = QRect(self.sidebar.geometry()).adjusted(-2, -2, 2, 2)
+        self.setMask(QRegion(sidebar_rect))
 
     def toggle_sidebar(self):
         self.sidebar_open = not self.sidebar_open
@@ -347,13 +434,17 @@ class SmartboardOverlay(QWidget):
             self.buttons["menu"].setText("☰")
             for button in self.buttons.values():
                 button.show()
+            if self.tool == "scroll":
+                self.apply_scroll_mode_mask()
             return
 
         self.sidebar.setGeometry(QRect(24, 44, 76, 70))
-        self.buttons["menu"].setText("›")
+        self.buttons["menu"].setText("▶")
         for name, button in self.buttons.items():
             if name != "menu":
                 button.hide()
+        if self.tool == "scroll":
+            self.apply_scroll_mode_mask()
 
     def start_hotkey_listener(self):
         def on_press(key):
@@ -386,6 +477,10 @@ class SmartboardOverlay(QWidget):
             self.show_overlay()
 
     def show_overlay(self):
+        self.clearMask()
+        # First call: get the geometry right BEFORE the screen capture
+        # so capture_context_before_overlay() snapshots the full virtual
+        # desktop rect that we're about to draw on.
         self.move_to_all_screens()
         self.context = self.capture_context_before_overlay()
         self.context_attempted = True
@@ -393,23 +488,29 @@ class SmartboardOverlay(QWidget):
         self.drawing = False
         self.current_points.clear()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self.apply_macos_overlay_behavior()
         self.sidebar.show()
         self.show()
         self.raise_()
         QApplication.processEvents()
-        self.apply_macos_overlay_behavior()
+        # Second call AFTER the HWND is realised and mapped. show() can
+        # cause Windows to re-snap the window to the primary monitor;
+        # this re-applies SetWindowPos with the virtual-desktop rect so
+        # the overlay actually spans both screens.
+        self.move_to_all_screens()
         self.update()
         if not self.context:
             self.show_notice(
-                "Screen Capture Blocked",
-                "The overlay could not freeze the visible screen. Enable Screen Recording for Terminal, VS Code, or Python, restart smartboard.py, then press W again.",
+                "Screen Capture Unavailable",
+                "The overlay could not freeze the visible screen. Install Pillow "
+                "(`pip install pillow`) and restart the app so the AI tools have "
+                "something to send to Claude.",
             )
 
     def hide_overlay(self):
         self.overlay_on = False
         self.drawing = False
         self.current_points.clear()
+        self.clearMask()
         self.sidebar.hide()
         self.ai_panel.hide()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -417,9 +518,10 @@ class SmartboardOverlay(QWidget):
         self.update()
 
     def capture_context_before_overlay(self):
-        if not self.has_screen_capture_permission():
+        if ImageGrab is None:
             print(
-                "macOS Screen Recording permission is not available. Cannot freeze the visible screen.",
+                "Pillow is not installed; cannot freeze the visible screen. "
+                "Run `pip install pillow` to enable the AI tools.",
                 flush=True,
             )
             self.context_pixmap = QPixmap()
@@ -431,182 +533,40 @@ class SmartboardOverlay(QWidget):
             pixmap = QPixmap()
             if pixmap.loadFromData(data):
                 self.context_pixmap = pixmap
-                self.save_debug_capture(data, "frozen_visible_screen")
-                print(
-                    f"Frozen visible screen for overlay/AI: "
-                    f"rect={rect.x()},{rect.y()},{rect.width()},{rect.height()}, bytes={len(data)}",
-                    flush=True,
-                )
                 return FrontWindowCapture(data, rect, None, "frozen visible screen")
 
         self.context_pixmap = QPixmap()
-        print("Could not freeze the visible screen. AI tools will not capture the wallpaper as a fallback.", flush=True)
+        print("Could not freeze the visible screen. AI tools will be disabled until the next toggle.", flush=True)
         return None
 
-    def has_screen_capture_permission(self):
-        if sys.platform != "darwin":
-            return True
-        if Quartz is None:
-            print("Quartz is not installed, so macOS Screen Recording permission cannot be checked.", flush=True)
-            return False
-        try:
-            preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
-            if preflight is None:
-                return True
-            if bool(preflight()):
-                return True
-
-            request = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
-            if request is not None:
-                request()
-            return bool(preflight())
-        except Exception as exc:
-            print(f"Could not check Screen Recording permission: {exc}", flush=True)
-            return False
-
-    def front_window_bounds_via_applescript(self):
-        if sys.platform != "darwin" or not os.path.exists("/usr/bin/osascript"):
-            return None
-
-        script = """
-        tell application "System Events"
-            set frontApp to first application process whose frontmost is true
-            set appName to name of frontApp
-            if (count of windows of frontApp) is 0 then return ""
-            set frontWindow to front window of frontApp
-            set windowPosition to position of frontWindow
-            set windowSize to size of frontWindow
-            return appName & "|" & (item 1 of windowPosition) & "," & (item 2 of windowPosition) & "," & (item 1 of windowSize) & "," & (item 2 of windowSize)
-        end tell
-        """
-
-        try:
-            result = subprocess.run(
-                ["/usr/bin/osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=4,
-                check=False,
-            )
-            output = result.stdout.strip()
-            if result.returncode != 0 or not output or "|" not in output:
-                return None
-            owner, raw_rect = output.split("|", 1)
-            x, y, width, height = [int(float(part.strip())) for part in raw_rect.split(",")]
-            if width < 120 or height < 80:
-                return None
-            return {"owner": owner.strip() or "front window", "rect": QRect(x, y, width, height)}
-        except Exception as exc:
-            print(f"AppleScript front-window bounds failed: {exc}", flush=True)
-            return None
-
-    def frontmost_real_window(self):
-        if sys.platform != "darwin" or Quartz is None:
-            return None
-
-        own_pid = os.getpid()
-        front_pid = None
-        if AppKit is not None:
-            try:
-                front_app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
-                front_pid = int(front_app.processIdentifier()) if front_app else None
-            except Exception:
-                front_pid = None
-
-        try:
-            options = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
-            windows = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
-        except Exception as exc:
-            print(f"Could not list macOS windows: {exc}", flush=True)
-            return None
-
-        candidates = []
-        for window in windows:
-            owner = str(window.get("kCGWindowOwnerName", ""))
-            pid = int(window.get("kCGWindowOwnerPID", -1))
-            layer = int(window.get("kCGWindowLayer", 999))
-            bounds = window.get("kCGWindowBounds", {})
-            alpha = float(window.get("kCGWindowAlpha", 1.0))
-            window_id = int(window.get("kCGWindowNumber", 0))
-            width = int(bounds.get("Width", 0))
-            height = int(bounds.get("Height", 0))
-
-            if pid == own_pid or layer != 0 or alpha <= 0 or width < 120 or height < 80:
-                continue
-            if owner in {"Dock", "Window Server", "SystemUIServer", "Control Center", "Notification Center"}:
-                continue
-
-            area = width * height
-            candidates.append(
-                {
-                    "window_id": window_id,
-                    "owner": owner,
-                    "pid": pid,
-                    "bounds": bounds,
-                    "area": area,
-                    "front_pid_match": pid == front_pid,
-                }
-            )
-
-        if not candidates:
-            return None
-
-        if front_pid is not None:
-            front_matches = [candidate for candidate in candidates if candidate["front_pid_match"]]
-            if front_matches:
-                return max(front_matches, key=lambda item: item["area"])
-
-        return candidates[0]
-
-    def rect_from_cg_bounds(self, bounds):
-        return QRect(
-            int(bounds.get("X", 0)),
-            int(bounds.get("Y", 0)),
-            int(bounds.get("Width", 0)),
-            int(bounds.get("Height", 0)),
-        )
-
-    def screencapture_window(self, window_id):
-        return self.run_screencapture(["/usr/sbin/screencapture", "-x", "-l", str(window_id)])
-
     def screencapture_rect(self, rect):
-        region = f"{rect.x()},{rect.y()},{rect.width()},{rect.height()}"
-        return self.run_screencapture(["/usr/sbin/screencapture", "-x", "-R", region])
-
-    def run_screencapture(self, base_command):
-        if sys.platform != "darwin" or not os.path.exists("/usr/sbin/screencapture"):
+        """Grab the requested virtual-screen rectangle on Windows via Pillow
+        and return PNG-encoded bytes. `all_screens=True` lets us reach
+        monitors that aren't the primary one (without it, Pillow crops to
+        the primary screen and ignores anything else)."""
+        if ImageGrab is None:
             return None
 
-        tmp_path = None
+        bbox = (rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height())
         try:
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                tmp_path = tmp.name
-
-            result = subprocess.run(
-                [*base_command, tmp_path],
-                capture_output=True,
-                timeout=8,
-                check=False,
-            )
-            if result.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-                stderr = result.stderr.decode("utf-8", errors="ignore").strip()
-                if stderr:
-                    print(f"screencapture failed: {stderr}", flush=True)
-                return None
-            with open(tmp_path, "rb") as image_file:
-                return image_file.read()
+            image = ImageGrab.grab(bbox=bbox, all_screens=True)
         except Exception as exc:
-            print(f"screencapture exception: {exc}", flush=True)
+            print(f"ImageGrab failed for bbox={bbox}: {exc}", flush=True)
             return None
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+
+        buffer = BytesIO()
+        try:
+            image.save(buffer, format="PNG")
+        except Exception as exc:
+            print(f"PNG encode failed: {exc}", flush=True)
+            return None
+        return buffer.getvalue()
 
     def mousePressEvent(self, event):
         if not self.overlay_on or event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self.tool == "scroll":
+            event.ignore()
             return
         if self.ai_busy:
             self.show_notice("ScreenSense AI", "Wait for the current answer to finish first.")
@@ -624,6 +584,9 @@ class SmartboardOverlay(QWidget):
     def mouseMoveEvent(self, event):
         if not self.overlay_on or not self.drawing:
             return
+        if self.tool == "scroll":
+            event.ignore()
+            return
         self.preview = event.position().toPoint()
         if self.tool in {"pen", "highlight"}:
             self.current_points.append(QPoint(self.preview))
@@ -635,20 +598,28 @@ class SmartboardOverlay(QWidget):
     def mouseReleaseEvent(self, event):
         if not self.overlay_on or not self.drawing:
             return
+        if self.tool == "scroll":
+            event.ignore()
+            return
 
         end = event.position().toPoint()
         self.preview = QPoint(end)
-        if self.tool == "pen" and len(self.current_points) > 1:
-            self.strokes.append(Stroke(list(self.current_points), QColor(255, 70, 92, 245), 5))
-        elif self.tool == "highlight" and len(self.current_points) > 1:
-            self.strokes.append(Stroke(list(self.current_points), QColor(255, 230, 75, 115), 20, True))
-        elif self.tool in self.AI_TOOLS:
+        if self.tool in self.AI_TOOLS:
             self.create_ai_box(self.tool, self.start, end)
+        else:
+            self.finish_stroke()
 
         self.drawing = False
         self.current_points.clear()
         self.update()
         event.accept()
+
+    def finish_stroke(self):
+        """Save the in-progress pen / highlighter stroke, if any."""
+        if self.tool == "pen" and len(self.current_points) > 1:
+            self.strokes.append(Stroke(list(self.current_points), QColor(255, 70, 92, 245), 5))
+        elif self.tool == "highlight" and len(self.current_points) > 1:
+            self.strokes.append(Stroke(list(self.current_points), QColor(255, 230, 75, 115), 20, True))
 
     def keyPressEvent(self, event):
         if self.overlay_on and event.matches(QKeySequence.StandardKey.Cancel):
@@ -686,7 +657,9 @@ class SmartboardOverlay(QWidget):
         if not png_bytes:
             self.ai_bridge.result_ready.emit(
                 tool,
-                "I could not freeze the visible screen, so I did not send Claude anything. Enable macOS Screen Recording for Terminal, VS Code, or Python, restart the app, and press W while the worksheet/browser is visible.",
+                "I could not freeze the visible screen, so I did not send Claude anything. "
+                "Install Pillow (`pip install pillow`), restart the app, and press W while "
+                "the worksheet/browser is visible.",
             )
             return
 
@@ -729,21 +702,18 @@ class SmartboardOverlay(QWidget):
         buffer.open(QIODevice.OpenModeFlag.WriteOnly)
         cropped.save(buffer, "PNG")
         buffer.close()
-        self.save_debug_capture(bytes(data), "ai_crop")
-        print(
-            f"AI crop from stored {self.context.owner}: "
-            f"{crop.x()},{crop.y()},{crop.width()},{crop.height()}, bytes={len(data)}",
-            flush=True,
-        )
         return bytes(data)
 
     def save_debug_capture(self, image_bytes, label):
+        # Kept for parity with the original Mac build but no longer called
+        # in the normal flow - the "Saved debug capture" stream was noise.
+        # Re-add the call inside capture_context_before_overlay or
+        # ai_capture_for_box if you need to inspect what's being sent.
         try:
             DEBUG_CAPTURE_DIR.mkdir(exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = DEBUG_CAPTURE_DIR / f"{label}_{stamp}.png"
             path.write_bytes(image_bytes)
-            print(f"Saved debug capture: {path}", flush=True)
         except Exception as exc:
             print(f"Could not save debug capture: {exc}", flush=True)
 
@@ -784,7 +754,7 @@ class SmartboardOverlay(QWidget):
         painter.setBrush(color)
         painter.drawEllipse(rect)
         painter.setPen(QColor(8, 12, 18))
-        painter.setFont(QFont("Arial", 23, QFont.Weight.Bold))
+        painter.setFont(QFont("Segoe UI", 23, QFont.Weight.Bold))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
     def draw_context_globe(self, painter, center, color):
@@ -952,7 +922,7 @@ class SmartboardOverlay(QWidget):
         self.ai_title.setStyleSheet(f"color: {accent};")
         self.ai_body.setHtml(
             """
-            <div style="font-family: Arial, sans-serif; color: #eef6ff;">
+            <div style="font-family: Segoe UI, Arial, sans-serif; color: #eef6ff;">
                 <p style="font-size: 16px; line-height: 1.45; margin: 0;">
                     Analyzing...
                 </p>
@@ -973,7 +943,7 @@ class SmartboardOverlay(QWidget):
     def answer_html(self, title, answer, accent):
         body = self.markdownish_to_html(answer)
         return f"""
-        <div style="font-family: Arial, sans-serif; color: #eef6ff;">
+        <div style="font-family: Segoe UI, Arial, sans-serif; color: #eef6ff;">
             <div style="font-size: 22px; font-weight: 800; color: {accent}; margin-bottom: 10px;">
                 {html.escape(title)}
             </div>
@@ -1032,7 +1002,7 @@ class SmartboardOverlay(QWidget):
 
     def inline_html(self, text):
         escaped = html.escape(text)
-        escaped = re.sub(r"`([^`]+)`", r"<span style='color:#fde68a; font-family: Menlo, monospace;'>\1</span>", escaped)
+        escaped = re.sub(r"`([^`]+)`", r"<span style='color:#fde68a; font-family: Consolas, monospace;'>\1</span>", escaped)
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<b style='color:#fef3c7;'>\1</b>", escaped)
         escaped = re.sub(r"__(.+?)__", r"<b style='color:#fef3c7;'>\1</b>", escaped)
         escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", escaped)
@@ -1135,7 +1105,7 @@ class SmartboardOverlay(QWidget):
         painter.setBrush(color)
         painter.drawEllipse(rect)
         painter.setPen(QColor(9, 13, 20))
-        painter.setFont(QFont("Arial", 20, QFont.Weight.Bold))
+        painter.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
     def draw_globe(self, painter, center, color):
@@ -1150,18 +1120,15 @@ class SmartboardOverlay(QWidget):
 
 
 def configure_macos_app_activation():
-    if sys.platform != "darwin" or AppKit is None:
-        return
-    try:
-        policy = getattr(AppKit, "NSApplicationActivationPolicyAccessory", 1)
-        AppKit.NSApp.setActivationPolicy_(policy)
-    except Exception as exc:
-        print(f"macOS activation policy warning: {exc}", flush=True)
+    """Kept for API compatibility with esp32_overlay_bridge.py and any other
+    caller from the original macOS build. No-op on Windows - Qt's
+    Tool + WindowDoesNotAcceptFocus flags already give us the same
+    'floating accessory window' behaviour without needing AppKit."""
+    return
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    configure_macos_app_activation()
     overlay = SmartboardOverlay()
     sys.exit(app.exec())

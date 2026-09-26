@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Generated at runtime
+output/
+smartboard_bookmarks/
+smartboard_debug_captures/
+
+# Per-setup calibration results (regenerate with the calibration scripts)
+calibration/*.npz
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

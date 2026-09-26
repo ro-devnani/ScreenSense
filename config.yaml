@@ -1,0 +1,80 @@
+# ScreenSense configuration. All scripts read this file from the current
+# directory, so run them from the repository root.
+
+cameras:
+  # OS camera indices (find them with tools/probe_cameras.py).
+  cam1_index: 1
+  cam2_index: 2
+  # Requested capture size / rate; must match what you calibrated with.
+  width: 640
+  height: 480
+  fps: 30
+
+# Plane mode only (screen.enabled: false): real-world drawing surface.
+plane:
+  width_mm: 600
+  height_mm: 400
+  # Corner coordinates in mm: top-left, top-right, bottom-right, bottom-left.
+  corners_mm:
+  - [0, 0]
+  - [600, 0]
+  - [600, 400]
+  - [0, 400]
+
+detection:
+  # HSV range of the pen tip (OpenCV hue is 0-179). Tune with
+  # tools/hsv_tuner.py, which rewrites these two lines when you press S.
+  hsv_lower: [43, 63, 0]
+  hsv_upper: [88, 255, 255]
+  # Blobs smaller than min_area (px^2) are ignored as noise; ideal_area is
+  # the blob size treated as confidence 1.0.
+  min_area: 20
+  ideal_area: 300
+  # Morphological open/close kernel size (odd).
+  morph_kernel_size: 5
+  # Optional per-camera crop [x0, y0, x1, y1] in pixels, or null.
+  roi_cam1: null
+  roi_cam2: null
+  # Screen mode: ignore detections whose colour sits this close to the edge
+  # of the HSV range (likely reflections). 0 disables the check.
+  color_confidence_min: 0.25
+
+fusion:
+  # Confidence multiplier when only one camera sees the tip.
+  single_camera_penalty: 0.6
+  # Detections below this confidence are treated as "not seen".
+  min_confidence: 0.2
+
+kalman:
+  # Plane mode (millimetres).
+  process_noise: 0.01
+  measurement_noise: 0.1
+  # Screen mode (pixels).
+  screen_process_noise: 4.0
+  screen_measurement_noise: 80.0
+
+output:
+  # Show the OpenCV debug window.
+  show_debug: true
+  # Plane mode: write strokes to output/strokes.json on exit.
+  save_strokes: true
+  min_move_mm: 1.0
+
+cursor:
+  # Move the OS cursor (Windows only).
+  enabled: true
+  # Plane mode: follow the Kalman-smoothed point instead of the raw one.
+  use_smoothed: true
+  invert_y: false
+
+screen:
+  # true: map pens straight to screen pixels (calibration/screen_calibrate.py).
+  # false: plane mode in millimetres (calibration/calibrate.py).
+  enabled: true
+  # Monitor to calibrate on (0 = primary, then left to right).
+  monitor_index: 1
+  # Points clicked per camera during screen calibration (>= 4).
+  calib_points: 8
+  # Drawing area [x0, y0, x1, y1] in virtual-desktop pixels. Written by
+  # screen_calibrate.py; delete the line to fall back to the whole monitor.
+  rect: [1960, 40, 3800, 1040]

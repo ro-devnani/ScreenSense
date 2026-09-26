@@ -16,6 +16,11 @@ def load_calibration(path: str) -> dict:
     rect — a 4-int [x0, y0, x1, y1] screen rectangle for that camera. The
     rect entry is None for plane-mm calibrations that don't store it.
     """
+    if not Path(path).is_file():
+        raise FileNotFoundError(
+            f"{path} not found. Run calibration/screen_calibrate.py (screen "
+            f"mode) or calibration/calibrate.py (plane mode) first."
+        )
     data = np.load(path)
     return {
         "mtx"  : data["mtx"],
