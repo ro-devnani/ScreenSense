@@ -47,8 +47,8 @@ calibration homography. There are two modes:
 ## Installation
 
 ```bash
-git clone https://github.com/ro-devnani/screensense.git
-cd screensense
+git clone https://github.com/ro-devnani/ScreenSense.git
+cd ScreenSense
 python -m venv .venv
 .venv\Scripts\activate          # Windows
 # source .venv/bin/activate     # macOS / Linux
@@ -238,3 +238,7 @@ draw in, keep 640x480, or set `output.show_debug: false`.
 
 **`Could not listen on port 65432`.** Another copy of the tracker or bridge
 is already running.
+
+## License
+
+[MIT](LICENSE)
